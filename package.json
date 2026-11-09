@@ -15,7 +15,8 @@
     "worker": "node --env-file=.env.local src/worker/main.ts",
     "typecheck": "tsc -p .",
     "test": "node --test \"test/**/*.test.ts\"",
-    "sample": "node --env-file=.env.local scripts/sample-leads.ts"
+    "sample": "node --env-file=.env.local scripts/sample-leads.ts",
+    "diagnose": "node --env-file=.env.local scripts/diagnose.ts"
   },
   "dependencies": {
     "pg": "^8.23.1"

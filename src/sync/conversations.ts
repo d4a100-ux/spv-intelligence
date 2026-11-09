@@ -3,7 +3,7 @@
  * Mensagens só são buscadas para conversas que mudaram desde o último ciclo (economia de cota).
  */
 import { DAY, MINUTE, getCursor, setCursor, setting, type SyncContext, type SyncResult } from "./context.ts";
-import { isHumanMessage, toIso } from "../lib/normalize.ts";
+import { isHumanMessage, messageKind, toIso } from "../lib/normalize.ts";
 
 type Cursor = {
   lastMessageAt: number;          // ms — tudo até aqui já foi processado
@@ -104,15 +104,15 @@ async function syncMessages(ctx: SyncContext, conversationId: string, contactId:
       if (!at) continue;
       if (stopBeforeMs !== null && Date.parse(at) < stopBeforeMs) { crossed = true; continue; }
       const res = await ctx.db.query(
-        `insert into messages (unit_id, crm_id, conversation_id, contact_id, direction, source, is_human, user_id,
+        `insert into messages (unit_id, crm_id, conversation_id, contact_id, direction, kind, source, is_human, user_id,
             message_type, status, body_preview, date_added, raw)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-         on conflict (unit_id, crm_id) do update set status=excluded.status, source=excluded.source,
+         values ($1,$2,$3,$4,$5,$14,$6,$7,$8,$9,$10,$11,$12,$13)
+         on conflict (unit_id, crm_id) do update set status=excluded.status, source=excluded.source, kind=excluded.kind,
            is_human=excluded.is_human, user_id=excluded.user_id
          returning (xmax = 0) as inserted`,
         [ctx.unit.id, m.id, conversationId, m.contactId ?? contactId, m.direction ?? null, m.source ?? null,
          isHumanMessage(m, humanSources), m.userId ?? null, m.messageType ?? null, m.status ?? null,
-         typeof m.body === "string" ? m.body.slice(0, 160) : null, at, JSON.stringify(metaOnly(m))]);
+         typeof m.body === "string" ? m.body.slice(0, 160) : null, at, JSON.stringify(metaOnly(m)), messageKind(m.messageType)]);
       if (res.rows[0]?.inserted) inserted++;
     }
     if (crossed || Array.isArray(box) || !box.nextPage || !box.lastMessageId) break;

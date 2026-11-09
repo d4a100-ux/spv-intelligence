@@ -72,11 +72,14 @@ test("conversas: mensagem humana do vendedor fecha o handoff; automação não c
   await db.query(`insert into seller_handoffs (unit_id, contact_id, seller_user_id, added_at, observed_after) values ($1,'c1','vend1',$2,$2)`, [unit.id, new Date(t0).toISOString()]);
 
   const iso = (m: number) => new Date(t0 + m * 60_000).toISOString();
+  // Formato espelha o observado no piloto: eventos de sistema chegam como outbound + source=app.
   const messages = [
-    { id: "m4", direction: "outbound", source: "app", userId: "vend1", dateAdded: iso(20) },
-    { id: "m3", direction: "inbound", dateAdded: iso(10) },
-    { id: "m2", direction: "outbound", source: "workflow", dateAdded: iso(2) },
-    { id: "m1", direction: "inbound", dateAdded: iso(1) },
+    { id: "m4", direction: "outbound", source: "app", userId: "vend1", messageType: "TYPE_WHATSAPP", dateAdded: iso(20) },
+    { id: "m3", direction: "inbound", messageType: "TYPE_WHATSAPP", dateAdded: iso(10) },
+    { id: "a2", direction: "outbound", source: "app", messageType: "TYPE_INTERNAL_COMMENT", userId: "sdr1", dateAdded: iso(4) },
+    { id: "a1", direction: "outbound", source: "app", messageType: "TYPE_ACTIVITY_OPPORTUNITY", dateAdded: iso(3) },
+    { id: "m2", direction: "outbound", source: "workflow", messageType: "TYPE_WHATSAPP", dateAdded: iso(2) },
+    { id: "m1", direction: "inbound", messageType: "TYPE_WHATSAPP", dateAdded: iso(1) },
   ];
   const api = fakeApi((path) => {
     if (path === "/conversations/search") return { conversations: [{ id: "cv1", contactId: "c1", lastMessageDate: t0 + 20 * 60_000 }], total: 1 };
@@ -87,12 +90,17 @@ test("conversas: mensagem humana do vendedor fecha o handoff; automação não c
 
   const c = (await db.query(`select first_human_reply_by, waiting_on, first_human_reply_at = $1::timestamptz as ok from contacts where crm_id='c1'`, [iso(20)])).rows[0];
   assert.equal(c.first_human_reply_by, "vend1");
-  assert.equal(c.ok, true, "a mensagem de workflow (minuto 2) não pode contar como primeira resposta");
+  assert.equal(c.ok, true, "workflow (min 2), atividade de oportunidade (min 3) e comentário interno (min 4) não são primeira resposta");
   assert.equal(c.waiting_on, "customer");
   const h = (await db.query(`select status, first_seller_action from seller_handoffs`)).rows[0];
   assert.deepEqual(h, { status: "seller_acted", first_seller_action: "message" });
-  const human = (await db.query(`select crm_id, is_human from messages where direction='outbound' order by crm_id`)).rows;
-  assert.deepEqual(human, [{ crm_id: "m2", is_human: false }, { crm_id: "m4", is_human: true }]);
+  const human = (await db.query(`select crm_id, kind, is_human from messages where direction='outbound' order by crm_id`)).rows;
+  assert.deepEqual(human, [
+    { crm_id: "a1", kind: "activity", is_human: false },
+    { crm_id: "a2", kind: "internal", is_human: false },
+    { crm_id: "m2", kind: "message", is_human: false },
+    { crm_id: "m4", kind: "message", is_human: true },
+  ]);
 });
 
 test("oportunidades: mudança de etapa usa o horário exato do CRM (lastStageChangeAt)", async () => {
@@ -143,4 +151,81 @@ test("monitoramento: 401 marca SÓ a unidade afetada como erro, grava log saniti
   assert.equal(j.status, "failed", "erro de autenticação não fica tentando à toa");
   const al = (await db.query(`select priority, rule_key from operational_alerts`)).rows;
   assert.deepEqual(al, [{ priority: "critical", rule_key: "integracao_falhando" }]);
+});
+
+test("B1: duplicado é detectado mesmo quando o contato mais antigo chega depois", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  // O sync ordena por dateUpdated: o lead novo chega antes do antigo (caso real de backfill).
+  const novo = { id: "novo", phone: "+55 11 90000-0001", dateAdded: "2026-11-01T10:00:00Z", dateUpdated: "2026-11-01T10:00:00Z" };
+  const antigo = { id: "antigo", phone: "(11) 90000-0001", dateAdded: "2026-01-01T10:00:00Z", dateUpdated: "2026-11-05T10:00:00Z" };
+  await syncContacts(ctxOf(db, unit, fakeApi(() => ({ contacts: [novo, antigo] }))));
+  const r = (await db.query(`select crm_id, origin_class, duplicate_of from contacts order by crm_id`)).rows;
+  assert.deepEqual(r, [
+    { crm_id: "antigo", origin_class: "unclassified", duplicate_of: null },
+    { crm_id: "novo", origin_class: "duplicate", duplicate_of: "antigo" },
+  ]);
+});
+
+test("B1: telefone corrigido no CRM desfaz a duplicidade", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  const antigo = { id: "antigo", phone: "11900000001", dateAdded: "2026-01-01T10:00:00Z", dateUpdated: "2026-11-01T10:00:00Z" };
+  let novo: any = { id: "novo", phone: "11900000001", dateAdded: "2026-11-01T10:00:00Z", dateUpdated: "2026-11-02T10:00:00Z" };
+  const api = fakeApi(() => ({ contacts: [antigo, novo] }));
+  await syncContacts(ctxOf(db, unit, api));
+  novo = { ...novo, phone: "11911112222", dateUpdated: "2026-11-03T10:00:00Z" };
+  await syncContacts(ctxOf(db, unit, api));
+  const r = (await db.query(`select origin_class, duplicate_of from contacts where crm_id='novo'`)).rows[0];
+  assert.deepEqual(r, { origin_class: "unclassified", duplicate_of: null });
+});
+
+test("D2: importação usa attributionSource.medium quando `source` vem vazio (comportamento real do CRM)", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  await db.query(`update units set settings = '{"import_sources":["csv_import"]}' where id=$1`, [unit.id]);
+  unit.settings = { import_sources: ["csv_import"] };
+  const mk = (id: string, medium: string, phone: string) => ({ id, phone, attributionSource: { medium }, dateAdded: "2026-11-01T10:00:00Z", dateUpdated: "2026-11-01T10:00:00Z" });
+  await syncContacts(ctxOf(db, unit, fakeApi(() => ({ contacts: [mk("a", "csv_import", "11911110001"), mk("b", "whatsapp", "11911110002")] }))));
+  const r = (await db.query(`select crm_id, origin_class from contacts order by crm_id`)).rows;
+  assert.deepEqual(r, [{ crm_id: "a", origin_class: "imported" }, { crm_id: "b", origin_class: "new" }]);
+});
+
+test("B2: mensagem do cliente não zera o tempo parado; espera da equipe começa na 1ª mensagem sem resposta", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  await db.query(`insert into contacts (unit_id,crm_id,date_added) values ($1,'c', now() - interval '3 days')`, [unit.id]);
+  await db.query(`insert into messages (unit_id,crm_id,conversation_id,contact_id,direction,is_human,date_added) values
+    ($1,'m1','cv','c','outbound',true, now() - interval '2 days'),
+    ($1,'m2','cv','c','inbound',null, now() - interval '30 minutes'),
+    ($1,'m3','cv','c','inbound',null, now() - interval '5 minutes')`, [unit.id]);
+  await db.query(`select refresh_contact_derived($1,'c')`, [unit.id]);
+  const c = (await db.query(`select waiting_on,
+      round(extract(epoch from now()-last_operational_activity_at)/3600) as horas_sem_acao_equipe,
+      round(extract(epoch from now()-waiting_since)/60) as min_esperando,
+      round(extract(epoch from now()-last_any_activity_at)/60) as min_ultima_movimentacao
+    from contacts`)).rows[0];
+  assert.equal(c.waiting_on, "team");
+  assert.equal(Number(c.horas_sem_acao_equipe), 48, "equipe sem agir há 2 dias");
+  assert.equal(Number(c.min_esperando), 30, "cliente esperando desde a 1ª mensagem não respondida");
+  assert.equal(Number(c.min_ultima_movimentacao), 5);
+});
+
+test("B6: funções de escrita não podem ser chamadas por usuário autenticado (API pública)", async () => {
+  const { pg, db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  await pg.exec(`set role authenticated`);
+  for (const sql of [`select * from claim_job('${unit.id}')`, `select refresh_contact_derived('${unit.id}','x')`, `select rebuild_seller_handoffs('${unit.id}')`]) {
+    await assert.rejects(db.query(sql), /permission denied/, sql);
+  }
+  await pg.exec(`reset role`);
+});
+
+test("normalizePhone: mesmo número BR com/sem código do país e com 0 de discagem", async () => {
+  const { normalizePhone } = await import("../src/lib/normalize.ts");
+  for (const p of ["+55 11 90000-0001", "(11) 90000-0001", "011 90000-0001", "5511900000001"]) {
+    assert.equal(normalizePhone(p), "5511900000001", p);
+  }
+  assert.equal(normalizePhone("+1 415 555 0100"), "14155550100");
+  assert.equal(normalizePhone("123"), null);
 });

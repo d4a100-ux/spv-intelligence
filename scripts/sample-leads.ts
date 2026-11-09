@@ -25,7 +25,8 @@ async function main() {
 
   const users = new Map((await db.query(`select crm_id, name from crm_users where unit_id=$1`, [unit.id])).rows.map((u) => [u.crm_id, u.name]));
   const header = ["link_crm", "nome", "telefone", "entrada (dateAdded)", "origem", "classificação D2", "responsável", "seguidores",
-    "1ª resposta humana", "1ª resposta por", "última msg cliente", "última msg equipe", "aguardando", "etapa atual", "CONFERE? (S/N)", "observação"];
+    "1ª resposta humana", "1ª resposta por", "última msg cliente", "última msg equipe", "aguardando", "aguardando desde",
+    "última ação da equipe", "etapa atual", "CONFERE? (S/N)", "observação"];
   const out = [header];
   for (const c of rows) {
     const opp = (await db.query(
@@ -35,10 +36,12 @@ async function main() {
     const fmt = (d: any) => (d ? new Date(d).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }) : "");
     out.push([
       `${APP}/v2/location/${unit.location_id}/contacts/detail/${c.crm_id}`, c.name ?? "", c.phone ?? "", fmt(c.date_added),
-      c.source ?? "", c.origin_class, users.get(c.assigned_to) ?? c.assigned_to ?? "(sem responsável)",
+      // No piloto `source` veio vazio em 100%: a origem real está em attributionSource.medium.
+      c.source ?? c.attribution?.medium ?? "", c.origin_class, users.get(c.assigned_to) ?? c.assigned_to ?? "(sem responsável)",
       (c.followers ?? []).map((f: string) => users.get(f) ?? f).join(" | "),
       fmt(c.first_human_reply_at), users.get(c.first_human_reply_by) ?? c.first_human_reply_by ?? "",
-      fmt(c.last_customer_msg_at), fmt(c.last_team_msg_at), c.waiting_on ?? "",
+      fmt(c.last_customer_msg_at), fmt(c.last_team_msg_at), c.waiting_on ?? "", fmt(c.waiting_since),
+      fmt(c.last_operational_activity_at),
       opp ? `${opp.stage} (${opp.status})` : "(sem oportunidade)", "", "",
     ]);
   }

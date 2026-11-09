@@ -33,16 +33,16 @@ git status --ignored                # .env.local e reports/ devem aparecer como 
 
 ## Passo 2: Revisar o SQL e o validador
 
-Já revisado e testado: `npm test` roda 11 testes num Postgres real em memória, **sem tocar em nenhum banco**. Pontos para a gestão conferir:
+Já revisado e testado: `npm test` roda 17 testes num Postgres real em memória, **sem tocar em nenhum banco**. Pontos para a gestão conferir:
 
 | Arquivo | O que conferir |
 |---|---|
-| [`supabase/migrations/0001_init.sql`](../supabase/migrations/0001_init.sql) | Lista do funil canônico (`canonical_stages`): os 17 estágios do briefing |
+| [`supabase/migrations/0001_init.sql`](../supabase/migrations/0001_init.sql) | Lista do funil canônico (`canonical_stages`): os 17 estágios do briefing + `sem_contato` (comprovado na Carros Online) |
 | [`scripts/validate-unit.ts`](../scripts/validate-unit.ts) | Somente leitura (GET e uma busca POST). Não imprime token nem dados de clientes |
 
 ```powershell
 npm install
-npm test          # esperado: 11 pass, 0 fail
+npm test          # esperado: 17 pass, 0 fail
 ```
 
 ## Passo 3: Criar a Private Integration na Carros Online

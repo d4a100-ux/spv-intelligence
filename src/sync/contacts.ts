@@ -59,7 +59,8 @@ export async function upsertContact(ctx: SyncContext, c: any, detectedBy: Detect
   const run = async (db: Db) => {
     const unitId = ctx.unit.id;
     const prev = (await db.query(
-      `select assigned_to, followers, synced_at, date_added from contacts where unit_id=$1 and crm_id=$2 for update`,
+      `select assigned_to, followers, synced_at, date_added, phone_normalized, email_normalized, source, attribution
+       from contacts where unit_id=$1 and crm_id=$2 for update`,
       [unitId, c.id])).rows[0];
     const now = ctx.now().toISOString();
     const dateAdded = toIso(c.dateAdded);
@@ -92,10 +93,19 @@ export async function upsertContact(ctx: SyncContext, c: any, detectedBy: Detect
       before: prev ? asStringArray(prev.followers) : null, after: followers,
       responsible: assignedTo, observedAfter, firstSeenLowerBound: dateAdded, now, detectedBy,
     });
-    if (!prev) {
-      await db.query(`select classify_contact_origin($1,$2)`, [unitId, c.id]);
-      await db.query(`select refresh_contact_derived($1,$2)`, [unitId, c.id]);
+    // D2/B1: (re)classifica o grupo inteiro de mesmo telefone/e-mail — o contato mais antigo pode chegar
+    // depois do duplicado, porque o sync ordena por dateUpdated e não por dateAdded.
+    const phoneN = normalizePhone(c.phone), emailN = normalizeEmail(c.email);
+    const originChanged = !prev
+      || prev.phone_normalized !== phoneN || prev.email_normalized !== emailN
+      || (prev.source ?? null) !== (c.source ?? null)
+      || (prev.attribution?.medium ?? null) !== (c.attributionSource?.medium ?? null);
+    if (originChanged) {
+      await db.query(`select classify_contact_group($1,$2,$3,$4)`,
+        [unitId, c.id, prev && prev.phone_normalized !== phoneN ? prev.phone_normalized : null,
+         prev && prev.email_normalized !== emailN ? prev.email_normalized : null]);
     }
+    if (!prev) await db.query(`select refresh_contact_derived($1,$2)`, [unitId, c.id]);
     await db.query(`select refresh_seller_handoffs($1,$2)`, [unitId, c.id]);
     return n;
   };

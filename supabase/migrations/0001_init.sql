@@ -127,8 +127,15 @@ create table contacts (
   last_customer_msg_at     timestamptz,
   last_team_msg_at         timestamptz,
   last_automated_msg_at    timestamptz,
+  -- Última ação da EQUIPE (msg humana, mudança de etapa, agendamento). Mensagem do cliente NÃO conta:
+  -- cliente escrevendo não significa que o lead está sendo atendido (base do "lead parado").
   last_operational_activity_at timestamptz,
+  -- Qualquer movimentação, inclusive do cliente (categoria "sem qualquer movimentação").
+  last_any_activity_at     timestamptz,
   waiting_on               text check (waiting_on in ('team','customer','none')),
+  -- Desde quando o lado em espera está esperando: equipe → 1ª inbound ainda sem resposta;
+  -- cliente → última outbound humana.
+  waiting_since            timestamptz,
   raw                  jsonb,
   synced_at            timestamptz not null default now(),
   primary key (unit_id, crm_id)
@@ -156,6 +163,9 @@ create table messages (
   conversation_id  text not null,
   contact_id       text,
   direction        text check (direction in ('inbound','outbound')),
+  -- O CRM grava eventos de sistema como "mensagens" outbound com source=app (comprovado no piloto):
+  -- TYPE_ACTIVITY_* (oportunidade/agendamento/SLA) e TYPE_INTERNAL_COMMENT. Só kind='message' é conversa.
+  kind             text not null default 'message' check (kind in ('message','activity','internal')),
   source           text,
   is_human         boolean,           -- null = não determinável (source ausente)
   user_id          text,
@@ -210,6 +220,7 @@ insert into canonical_stages (key,label,position,is_terminal,outcome) values
  ('proposta','Proposta',120,false,null),
  ('aguardando_carro','Aguardando carro',130,false,null),
  ('ficha_negada','Ficha negada',140,true,'lost'),
+ ('sem_contato','Não conseguiu contato',145,true,'lost'),
  ('vendido','Vendido',150,true,'won'),
  ('sem_interesse','Sem interesse',160,true,'lost'),
  ('perdido','Perdido',170,true,'lost');
@@ -496,6 +507,7 @@ create index on contacts (unit_id, date_added desc);
 create index on contacts (unit_id, date_updated desc);
 create index on contacts (unit_id, assigned_to);
 create index on contacts (unit_id, last_operational_activity_at);
+create index on contacts (unit_id, waiting_on, waiting_since);
 create index on contacts (unit_id, waiting_on) where waiting_on is not null;
 create index on contacts (unit_id) where first_human_reply_at is null;
 create index on contacts (unit_id, phone_normalized) where phone_normalized is not null;
@@ -506,6 +518,7 @@ create index on conversations (unit_id, contact_id);
 create index on messages (unit_id, conversation_id, date_added);
 create index on messages (unit_id, contact_id, date_added);
 create index on messages (unit_id, user_id, date_added) where is_human;
+create index on contacts (unit_id, (coalesce(source, attribution->>'medium')));
 create index on opportunities (unit_id, stage_id);
 create index on opportunities (unit_id, status);
 create index on opportunities (unit_id, assigned_to);
@@ -563,11 +576,17 @@ returns void language sql as $$
       max(date_added) filter (where direction = 'inbound')                as last_in,
       max(date_added) filter (where direction = 'outbound' and is_human)  as last_team,
       max(date_added) filter (where direction = 'outbound' and is_human is not true) as last_auto
-    from messages where unit_id = p_unit and contact_id = p_contact
+    from messages where unit_id = p_unit and contact_id = p_contact and kind = 'message'
   ), fr as (
     select date_added, user_id from messages
-    where unit_id = p_unit and contact_id = p_contact and direction = 'outbound' and is_human
+    where unit_id = p_unit and contact_id = p_contact and kind = 'message' and direction = 'outbound' and is_human
     order by date_added asc limit 1
+  ), unanswered as (
+    -- 1ª mensagem do cliente depois da última resposta humana (início da espera pela equipe)
+    select min(x.date_added) as first_in
+    from messages x, m
+    where x.unit_id = p_unit and x.contact_id = p_contact and x.kind = 'message' and x.direction = 'inbound'
+      and (m.last_team is null or x.date_added > m.last_team)
   ), o as (
     select max(last_stage_change_at) as last_stage from opportunities where unit_id = p_unit and contact_id = p_contact
   ), a as (
@@ -584,21 +603,28 @@ returns void language sql as $$
       when m.last_in is not null and (m.last_team is null or m.last_in > m.last_team) then 'team'
       when m.last_team is not null then 'customer'
       else 'none' end,
-    -- automação NÃO conta como movimentação operacional
-    last_operational_activity_at = greatest(c.date_added, m.last_team, m.last_in, o.last_stage, a.last_appt)
-  from m, o, a
+    waiting_since = case
+      when m.last_in is not null and (m.last_team is null or m.last_in > m.last_team) then unanswered.first_in
+      when m.last_team is not null then m.last_team
+      else null end,
+    -- automação e mensagem do cliente NÃO contam como movimentação operacional da equipe
+    last_operational_activity_at = greatest(c.date_added, m.last_team, o.last_stage, a.last_appt),
+    last_any_activity_at         = greatest(c.date_added, m.last_team, m.last_in, m.last_auto, o.last_stage, a.last_appt)
+  from m, o, a, unanswered
   where c.unit_id = p_unit and c.crm_id = p_contact;
 $$;
 
 -- D2: duplicidade = mesmo telefone ou e-mail normalizado de um contato MAIS ANTIGO na MESMA unidade.
--- Importação = `source` contido em units.settings.import_sources (só quando a gestão configurar).
+-- Importação = canal de origem contido em units.settings.import_sources (só quando a gestão configurar).
+-- Canal de origem: no piloto `source` veio vazio em 100% e a origem real está em attributionSource.medium.
 create or replace function classify_contact_origin(p_unit uuid, p_contact text)
 returns void language sql as $$
   update contacts c set
     duplicate_of = d.crm_id,
     origin_class = case
       when d.crm_id is not null then 'duplicate'
-      when c.source is not null and coalesce(u.settings->'import_sources','[]'::jsonb) ? c.source then 'imported'
+      when coalesce(c.source, c.attribution->>'medium') is not null
+           and coalesce(u.settings->'import_sources','[]'::jsonb) ? coalesce(c.source, c.attribution->>'medium') then 'imported'
       when jsonb_array_length(coalesce(u.settings->'import_sources','[]'::jsonb)) > 0 then 'new'
       else 'unclassified' end
   from units u
@@ -614,13 +640,33 @@ returns void language sql as $$
   where u.id = p_unit and c.unit_id = p_unit and c.crm_id = p_contact;
 $$;
 
+-- B1: reclassifica TODO o grupo com o mesmo telefone/e-mail na unidade. Necessário porque o sync
+-- não recebe os contatos em ordem de dateAdded: o mais antigo pode chegar depois do duplicado.
+-- p_old_phone/p_old_email: valores anteriores, para reclassificar o grupo de onde o contato saiu.
+create or replace function classify_contact_group(p_unit uuid, p_contact text, p_old_phone text default null, p_old_email text default null)
+returns void language plpgsql as $$
+declare r record;
+begin
+  for r in
+    select o.crm_id from contacts o, contacts me
+    where me.unit_id = p_unit and me.crm_id = p_contact and o.unit_id = p_unit
+      and (o.crm_id = p_contact
+        or (me.phone_normalized is not null and o.phone_normalized = me.phone_normalized)
+        or (me.email_normalized is not null and o.email_normalized = me.email_normalized)
+        or (p_old_phone is not null and o.phone_normalized = p_old_phone)
+        or (p_old_email is not null and o.email_normalized = p_old_email))
+  loop
+    perform classify_contact_origin(p_unit, r.crm_id);
+  end loop;
+end $$;
+
 -- Atualiza handoffs pendentes quando o vendedor atua (mensagem humana, agendamento ou mudança de etapa).
 create or replace function refresh_seller_handoffs(p_unit uuid, p_contact text)
 returns void language sql as $$
   with acts as (
     select h.id,
       (select min(m.date_added) from messages m
-        where m.unit_id = h.unit_id and m.contact_id = h.contact_id and m.is_human
+        where m.unit_id = h.unit_id and m.contact_id = h.contact_id and m.kind = 'message' and m.is_human
           and m.direction = 'outbound' and m.user_id = h.seller_user_id and m.date_added >= coalesce(h.observed_after, h.added_at)) as msg_at,
       (select min(coalesce(a.date_added, a.first_seen_at)) from appointments a
         where a.unit_id = h.unit_id and a.contact_id = h.contact_id
@@ -694,7 +740,7 @@ cross join lateral (
   select max(m.date_added) filter (where m.direction = 'inbound') as last_in,
          max(m.date_added) filter (where m.direction = 'outbound' and m.is_human) as last_team
   from messages m
-  where m.unit_id = c.unit_id and m.conversation_id = c.crm_id
+  where m.unit_id = c.unit_id and m.conversation_id = c.crm_id and m.kind = 'message'
     and m.date_added >= now() - make_interval(hours => coalesce((u.settings->>'active_window_hours')::int, 24))
 ) w
 where w.last_in is not null and w.last_team is not null;
@@ -767,12 +813,26 @@ alter table crm_events enable row level security;
 alter table jobs enable row level security;
 alter table sync_cursors enable row level security;
 
--- Funções de escrita: não expor via API pública
-revoke execute on function claim_job(uuid) from public;
-revoke execute on function rebuild_seller_handoffs(uuid) from public;
-revoke execute on function refresh_contact_derived(uuid, text) from public;
-revoke execute on function classify_contact_origin(uuid, text) from public;
-revoke execute on function refresh_seller_handoffs(uuid, text) from public;
+-- B6: funções de escrita não podem ser chamadas pela API pública (PostgREST /rpc).
+-- No Supabase, anon/authenticated recebem EXECUTE por default privileges — revogar de `public`
+-- não basta; é preciso revogar explicitamente de cada papel. O worker usa a conexão direta (owner).
+do $$
+declare f text;
+begin
+  foreach f in array array[
+    'claim_job(uuid)', 'rebuild_seller_handoffs(uuid)', 'refresh_contact_derived(uuid, text)',
+    'classify_contact_origin(uuid, text)', 'classify_contact_group(uuid, text, text, text)',
+    'refresh_seller_handoffs(uuid, text)'
+  ] loop
+    execute format('revoke execute on function %s from public', f);
+    if exists (select 1 from pg_roles where rolname = 'anon') then
+      execute format('revoke execute on function %s from anon', f);
+    end if;
+    if exists (select 1 from pg_roles where rolname = 'authenticated') then
+      execute format('revoke execute on function %s from authenticated', f);
+    end if;
+  end loop;
+end $$;
 
 -- Realtime para a UI
 alter publication supabase_realtime add table operational_alerts, metric_snapshots, units;

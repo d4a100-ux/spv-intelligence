@@ -17,7 +17,7 @@
 | # | Decisão | Como foi implementado |
 |---|---|---|
 | **D1** | Webhooks aprovados para uma etapa posterior; o piloto roda com polling incremental. | Polling incremental é a base em todas as etapas. Webhooks via app privado do Marketplace na **Etapa 6**. O polling continua ativo como rede de segurança. |
-| **D2** | Lead = contato criado no CRM (`dateAdded`). Oportunidades contadas à parte. Diferenciar novos, importados e duplicados quando os dados permitirem. | `contacts.origin_class` (`new` / `imported` / `duplicate` / `unclassified`). **Duplicado:** mesmo telefone ou e-mail normalizado de um contato mais antigo **na mesma unidade**. **Importado:** `source` contido em `units.settings.import_sources`, lista definida pela gestão depois que o validador mostrar os valores reais de `source`. Até lá, o contato fica `unclassified`. |
+| **D2** | Lead = contato criado no CRM (`dateAdded`). Oportunidades contadas à parte. Diferenciar novos, importados e duplicados quando os dados permitirem. | `contacts.origin_class` (`new` / `imported` / `duplicate` / `unclassified`). **Duplicado:** mesmo telefone ou e-mail normalizado de um contato mais antigo **na mesma unidade**. **Importado:** canal de origem contido em `units.settings.import_sources`. **Comprovado no piloto:** `source` vem vazio em 100% dos contatos; o canal real está em `attributionSource.medium` (whatsapp, whatsapp_coex, instagram, manual). O sistema usa `coalesce(source, attributionSource.medium)`. Enquanto a gestão não definir quais canais indicam importação, o contato fica `unclassified`. Duplicidade é recalculada para o grupo inteiro de mesmo telefone ou e-mail, e os telefones são normalizados com o código 55. |
 | **D3** | Conversa ativa = janela de 24 h com ≥ 1 inbound do cliente **e** ≥ 1 outbound **humana**, considerando o estado da conversa. | View `v_active_conversations`. A janela é configurável por unidade (`active_window_hours`). Mensagens de workflow, campanha e bulk **não** contam. A view também informa `is_commercially_open`, que exclui contatos só com oportunidades encerradas. |
 | **D4** | Horário comercial individual por unidade. | `units.business_hours`, mais a tabela `unit_holidays` e a função `business_minutes()`. **Sem horário configurado, o SLA em minutos úteis aparece como _indisponível_ (NULL), nunca como zero.** Nenhum horário vem pré-preenchido. |
 
@@ -192,15 +192,16 @@ Tipo: **E** = estoque (fotografia do momento) · **F** = fluxo (ocorrido no per�
 | Leads recebidos | F | contatos com `dateAdded` no período, no fuso da unidade, separados por `origin_class` (D2) | contacts | ✅ data · ⚠️ separação de importados depende de `import_sources` |
 | Novas oportunidades | F | `created_at_crm` no período (contado à parte, D2) | opportunities | ✅ |
 | Sem responsável | E | `assigned_to IS NULL` | contacts | ✅ |
-| Sem primeira resposta | E | sem outbound humana (`first_human_reply_at IS NULL`) | messages | ⚠️ depende da regra humano × automação (R3) |
+| Sem primeira resposta | E | sem outbound humana (`first_human_reply_at IS NULL`), ignorando eventos de sistema (`messages.kind <> 'message'`) | messages | ✅ · autoria das mensagens sem `userId` pendente (R3) |
 | Tempo de 1ª resposta | F | `first_human_reply_at − date_added`, por coorte de entrada. Exibe minutos corridos e minutos úteis (D4) | messages + business_minutes | ⚠️ minutos úteis = indisponível até configurar o horário |
-| Conversas ativas | E | D3 (`v_active_conversations`) | messages | ⚠️ R3 |
-| Aguardando equipe / cliente | E | `waiting_on` | derivado | ⚠️ R3 |
-| Leads parados | E | `now − last_operational_activity_at` (automação não conta) | derivado | ✅ |
+| Conversas ativas | E | D3 (`v_active_conversations`), só `kind = 'message'` | messages | ✅ |
+| Aguardando equipe / cliente | E | `waiting_on` + `waiting_since` (equipe: 1ª mensagem do cliente sem resposta; cliente: última resposta humana) | derivado | ✅ |
+| Leads parados | E | `now − last_operational_activity_at` = última ação **da equipe** (mensagem humana, etapa ou agendamento). Mensagem do cliente e automação **não** zeram o tempo. "Sem qualquer movimentação" usa `last_any_activity_at` | derivado | ✅ |
 | Vendedor seguidor sem atuação | E | `seller_handoffs.status = awaiting_seller` | histórico próprio | ❌ antes do H0 · ✅ depois |
 | Mudanças de fase | F | `opportunity_history` (exclui snapshot) | histórico próprio | ❌ antes do H0 · ✅ depois |
 | Tempo em cada etapa | F | diferença entre mudanças consecutivas | histórico próprio | ❌ antes do H0 |
-| Agendamentos / confirmações / comparecimentos | F | `appointment_status` | appointments | ⚠️ valores reais do enum saem do validador |
+| Agendamentos / confirmações | F | `appointment_status` (comprovado: `confirmed`, `noshow`) | appointments | ✅ |
+| Visitas realizadas / não comparecimentos | F | entrada nas etapas canônicas `visita_realizada` / `nao_compareceu`. O calendário **não** registra `showed` (0 em 128 agendamentos) | opportunity_history + stage_mappings | ✅ após aprovar o mapeamento |
 | Vendas / perdas | F | `status = won/lost` com `lastStatusChangeAt` no período, ou etapa canônica | opportunities | ✅ |
 | SDR × vendedor | — | classificação manual | crm_users | ❌ cadastro manual |
 
@@ -210,7 +211,7 @@ Tipo: **E** = estoque (fotografia do momento) · **F** = fluxo (ocorrido no per�
 |---|---|---|---|
 | R1 | Webhooks nativos dependem de app no Marketplace | D1: polling agora, app privado na Etapa 6 | Decidido |
 | R2 | API sem histórico de responsável, seguidor ou etapa | Captura própria desde o H0 com precisão declarada (`time_source`) | Implementado |
-| R3 | Separar resposta humana de automação | `is_human` = outbound com `source ∈ human_sources` (padrão `["app"]`), configurável por unidade; o validador mostra a distribuição `source × userId` | Validar na Etapa 2 |
+| R3 | Separar resposta humana de automação | **Comprovado:** eventos de sistema (`TYPE_ACTIVITY_*`, `TYPE_INTERNAL_COMMENT`) chegam como outbound + `source=app` e agora ficam em `messages.kind`, fora do cálculo. `is_human` = mensagem real com `source ∈ human_sources` (padrão `["app"]`). Pendente: 303 de 891 mensagens `app` não têm `userId`; o padrão de tempo é humano e elas contam como resposta da equipe **sem autor** | Confirmar autoria no CRM |
 | R4 | Header `Version` divergente | Versão comprovada por recurso e por subconta | Implementado |
 | R5 | Limites de requisição | Limitador por unidade, headers autoritativos, reserva diária | Implementado |
 | R6 | Campos da busca de conversas não documentados | Validador mede presença; fallback para `sort[0]` e `dateUpdated` | Validar na Etapa 2 |
