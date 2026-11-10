@@ -57,8 +57,12 @@ export async function enqueueDue(db: Db, unitId: string, opts: { onlyHealth: boo
   }
 }
 
+/** Prioridade de continuação: vai para o FIM da fila (depois dos ciclos normais de todos os recursos),
+ *  para que uma carga longa não impeça o primeiro snapshot dos outros recursos. */
+export const CONTINUATION_PRIORITY_OFFSET = 50;
+
 export async function enqueueContinuation(db: Db, unitId: string, kind: JobKind, fromJobId: number): Promise<void> {
   await db.query(
     `insert into jobs (unit_id, kind, priority, dedupe_key) values ($1,$2,$3,$4) on conflict (dedupe_key) do nothing`,
-    [unitId, kind, JOBS[kind].priority + 1, `${unitId}:${kind}:cont:${fromJobId}`]);
+    [unitId, kind, JOBS[kind].priority + CONTINUATION_PRIORITY_OFFSET, `${unitId}:${kind}:cont:${fromJobId}`]);
 }

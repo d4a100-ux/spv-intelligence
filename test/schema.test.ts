@@ -52,10 +52,9 @@ test("RLS: gestor só enxerga as unidades liberadas; tokens e jobs inacessíveis
   await pg.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${uid}', false);`);
   const seen = await db.query(`select crm_id from contacts order by 1`);
   assert.deepEqual(seen.rows.map((r) => r.crm_id), ["ca"], "não pode ver contatos da unidade B");
-  const creds = await db.query(`select * from integration_credentials`);
-  assert.equal(creds.rows.length, 0, "tokens nunca visíveis ao usuário autenticado");
-  const jobs = await db.query(`select * from jobs`);
-  assert.equal(jobs.rows.length, 0);
+  // Sem grant + RLS sem policy: acesso NEGADO (mais forte que "tabela vazia").
+  await assert.rejects(db.query(`select * from integration_credentials`), /permission denied/, "tokens nunca acessíveis ao usuário autenticado");
+  await assert.rejects(db.query(`select * from jobs`), /permission denied/);
   await pg.exec(`reset role;`);
 });
 
@@ -99,4 +98,24 @@ test("D3: conversa ativa exige inbound E outbound humana na janela", async () =>
     ($1,'m4','c2','k2','outbound',false, now()-interval '1 hour')`, [u]);
   const r = await db.query(`select conversation_id from v_active_conversations`);
   assert.deepEqual(r.rows.map((x) => x.conversation_id), ["c1"], "c2 só teve automação → não é ativa");
+});
+
+test("privilégios explícitos: gestor lê dados da sua unidade; anon não lê nada; credenciais negadas", async () => {
+  const { pg, db } = await createTestDb();
+  const a = (await db.query(`insert into units (slug,name,location_id) values ('a','A','LA') returning id`)).rows[0].id;
+  await db.query(`insert into contacts (unit_id, crm_id) values ($1,'c1')`, [a]);
+  const uid = "22222222-2222-2222-2222-222222222222";
+  await db.query(`insert into auth.users (id) values ($1)`, [uid]);
+  await db.query(`insert into app_users (id, role) values ($1,'manager')`, [uid]);
+  await db.query(`insert into app_user_units values ($1,$2)`, [uid, a]);
+
+  await pg.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${uid}', false);`);
+  assert.equal((await db.query(`select count(*)::int n from contacts`)).rows[0].n, 1);
+  assert.equal((await db.query(`select count(*)::int n from v_active_conversations`)).rows[0].n, 0);
+  await assert.rejects(db.query(`select * from integration_credentials`), /permission denied/);
+  await assert.rejects(db.query(`select * from jobs`), /permission denied/);
+  await assert.rejects(db.query(`update contacts set name='x'`), /permission denied/);
+  await pg.exec(`reset role; set role anon;`);
+  await assert.rejects(db.query(`select * from contacts`), /permission denied/);
+  await pg.exec(`reset role;`);
 });

@@ -10,6 +10,14 @@ export function getPool(): pg.Pool {
       connectionString: config.databaseUrl,
       max: Number(process.env.DB_POOL_MAX ?? 12),
       ssl: /localhost|127\.0\.0\.1/.test(config.databaseUrl) ? undefined : { rejectUnauthorized: false },
+      keepAlive: true,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 15_000,
+    });
+    // Conexão OCIOSA derrubada pela rede (ECONNRESET) emite 'error' no pool. Sem este handler o Node
+    // encerra o processo inteiro (causa da queda de 09/11). O pool descarta o cliente e cria outro.
+    pool.on("error", (e) => {
+      console.error(JSON.stringify({ ts: new Date().toISOString(), level: "warn", msg: "conexão ociosa do banco perdida (será recriada)", error: e.message }));
     });
   }
   return pool;

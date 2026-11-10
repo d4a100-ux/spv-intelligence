@@ -8,6 +8,9 @@ import { getCursor, setCursor, type SyncContext, type SyncResult } from "./conte
 import { asStringArray, toIso } from "../lib/normalize.ts";
 import { recordFollowers, recordOpportunity, type DetectedBy } from "../processing/history.ts";
 import { LcError } from "../integrations/leadconnector/errors.ts";
+import { runInLanes } from "../lib/lanes.ts";
+
+const LANES = Number(process.env.SYNC_DB_LANES ?? 8);
 
 type Cursor = {
   mode: "backfill" | "open_scan";
@@ -33,7 +36,11 @@ export async function syncOpportunities(ctx: SyncContext): Promise<SyncResult> {
       startAfter: startAfter as any, startAfterId,
     });
     const list: any[] = r?.opportunities ?? [];
-    for (const o of list) { changes += await upsertOpportunity(ctx, o, detectedBy, scanStartedAt); upserted++; }
+    // Paralelo por pistas; mesmo contato = mesma pista (campos derivados e handoffs do contato).
+    const results = await runInLanes(list, LANES, (o) => String(o.contactId ?? o.contact?.id ?? o.id),
+      (o) => upsertOpportunity(ctx, o, detectedBy, scanStartedAt));
+    for (const n of results) changes += n;
+    upserted += list.length;
 
     const meta = r?.meta ?? {};
     if (list.length < PAGE || (!meta.nextPage && !meta.startAfterId)) {

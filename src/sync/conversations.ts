@@ -4,6 +4,9 @@
  */
 import { DAY, MINUTE, getCursor, setCursor, setting, type SyncContext, type SyncResult } from "./context.ts";
 import { isHumanMessage, messageKind, toIso } from "../lib/normalize.ts";
+import { runInLanes } from "../lib/lanes.ts";
+
+const LANES = Number(process.env.SYNC_DB_LANES ?? 8);
 
 type Cursor = {
   lastMessageAt: number;          // ms — tudo até aqui já foi processado
@@ -11,7 +14,8 @@ type Cursor = {
 };
 
 const PAGE = 100;
-const MAX_PAGES_PER_RUN = 30;
+/** Poucas páginas por rodada: a carga longa é intercalada com contatos/oportunidades/agendamentos. */
+const MAX_PAGES_PER_RUN = 5;
 const MAX_MESSAGE_PAGES = 20;
 const OVERLAP_MS = 2 * MINUTE;
 
@@ -38,13 +42,18 @@ export async function syncConversations(ctx: SyncContext): Promise<SyncResult> {
       startAfterDate: startAfterDate as any,
     });
     const list: any[] = r?.conversations ?? [];
+    // A busca vem ordenada (desc): processa até a primeira conversa mais antiga que o cursor.
+    const fresh: { cv: any; lm: number | null }[] = [];
     for (const cv of list) {
       const lm = lastMsgMs(cv);
       if (lm !== null && lm < floor) { reachedOld = true; break; }
       if (lm !== null && lm > newMax) newMax = lm;
-      changes += await syncOneConversation(ctx, cv, lm);
-      upserted++;
+      fresh.push({ cv, lm });
     }
+    // Paralelo por pistas; o mesmo contato fica sempre na mesma pista (campos derivados/handoffs).
+    const results = await runInLanes(fresh, LANES, (x) => String(x.cv.contactId ?? x.cv.id), (x) => syncOneConversation(ctx, x.cv, x.lm));
+    for (const n of results) changes += n;
+    upserted += fresh.length;
     if (list.length < PAGE) { reachedOld = true; break; }
     const last = list[list.length - 1];
     startAfterDate = Array.isArray(last?.sort) ? last.sort[0] : last?.lastMessageDate;
@@ -99,21 +108,30 @@ async function syncMessages(ctx: SyncContext, conversationId: string, contactId:
     const box = r?.messages ?? {};
     const list: any[] = Array.isArray(box) ? box : (box.messages ?? []);
     let crossed = false;
+    // Uma página inteira = UM comando no banco (antes: um comando por mensagem).
+    const rows: unknown[][] = [];
+    const seen = new Set<string>();
     for (const m of list) {
       const at = toIso(m.dateAdded);
-      if (!at) continue;
+      if (!at || !m.id || seen.has(m.id)) continue;   // id repetido no mesmo lote quebraria o ON CONFLICT
       if (stopBeforeMs !== null && Date.parse(at) < stopBeforeMs) { crossed = true; continue; }
-      const res = await ctx.db.query(
+      seen.add(m.id);
+      rows.push([ctx.unit.id, m.id, conversationId, m.contactId ?? contactId, m.direction ?? null, messageKind(m.messageType),
+        m.source ?? null, isHumanMessage(m, humanSources), m.userId ?? null, m.messageType ?? null, m.status ?? null,
+        typeof m.body === "string" ? m.body.slice(0, 160) : null, at, JSON.stringify(metaOnly(m))]);
+    }
+    if (rows.length) {
+      const COLS = 14;
+      const values = rows.map((_, i) => `(${Array.from({ length: COLS }, (_, k) => `$${i * COLS + k + 1}`).join(",")})`).join(",");
+      const res = await ctx.db.query<{ inserted: boolean }>(
         `insert into messages (unit_id, crm_id, conversation_id, contact_id, direction, kind, source, is_human, user_id,
             message_type, status, body_preview, date_added, raw)
-         values ($1,$2,$3,$4,$5,$14,$6,$7,$8,$9,$10,$11,$12,$13)
+         values ${values}
          on conflict (unit_id, crm_id) do update set status=excluded.status, source=excluded.source, kind=excluded.kind,
            is_human=excluded.is_human, user_id=excluded.user_id
          returning (xmax = 0) as inserted`,
-        [ctx.unit.id, m.id, conversationId, m.contactId ?? contactId, m.direction ?? null, m.source ?? null,
-         isHumanMessage(m, humanSources), m.userId ?? null, m.messageType ?? null, m.status ?? null,
-         typeof m.body === "string" ? m.body.slice(0, 160) : null, at, JSON.stringify(metaOnly(m)), messageKind(m.messageType)]);
-      if (res.rows[0]?.inserted) inserted++;
+        rows.flat());
+      inserted += res.rows.filter((x) => x.inserted).length;
     }
     if (crossed || Array.isArray(box) || !box.nextPage || !box.lastMessageId) break;
     lastMessageId = box.lastMessageId;

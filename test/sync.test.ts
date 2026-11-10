@@ -229,3 +229,69 @@ test("normalizePhone: mesmo número BR com/sem código do país e com 0 de disca
   assert.equal(normalizePhone("+1 415 555 0100"), "14155550100");
   assert.equal(normalizePhone("123"), null);
 });
+
+test("pistas: mesma chave em sequência e na ordem; resultados na ordem original", async () => {
+  const { runInLanes } = await import("../src/lib/lanes.ts");
+  const log: string[] = [];
+  const items = ["a1", "b1", "a2", "c1", "a3", "b2"];
+  const out = await runInLanes(items, 4, (s) => s[0], async (s) => {
+    log.push(`start ${s}`); await new Promise((r) => setTimeout(r, s.startsWith("a") ? 15 : 1)); log.push(`end ${s}`); return s.toUpperCase();
+  });
+  assert.deepEqual(out, ["A1", "B1", "A2", "C1", "A3", "B2"]);
+  const aEvents = log.filter((x) => x.endsWith("a1") || x.endsWith("a2") || x.endsWith("a3"));
+  assert.deepEqual(aEvents, ["start a1", "end a1", "start a2", "end a2", "start a3", "end a3"], "mesma chave nunca em paralelo");
+});
+
+test("mensagens em lote: id repetido na mesma página não quebra; reprocessar não duplica", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  const t = Date.now() - 60_000;
+  const msgs = [
+    { id: "m2", direction: "outbound", source: "app", userId: "u", messageType: "TYPE_WHATSAPP", dateAdded: new Date(t).toISOString() },
+    { id: "m2", direction: "outbound", source: "app", userId: "u", messageType: "TYPE_WHATSAPP", dateAdded: new Date(t).toISOString() },
+    { id: "m1", direction: "inbound", messageType: "TYPE_WHATSAPP", dateAdded: new Date(t - 1000).toISOString() },
+  ];
+  let lmd = t;
+  const api = fakeApi((path) => path === "/conversations/search"
+    ? { conversations: [{ id: "cv", contactId: "c", lastMessageDate: lmd }] }
+    : { messages: { messages: msgs, nextPage: false } });
+  await syncConversations(ctxOf(db, unit, api));
+  lmd = t + 1; // conversa "mudou" → busca mensagens de novo
+  await syncConversations(ctxOf(db, unit, api));
+  assert.equal((await db.query(`select count(*)::int n from messages`)).rows[0].n, 2);
+});
+
+test("resiliência: falha do banco fora de um job não derruba o loop da unidade", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  let failures = 2;
+  const flaky = { ...db, query: async (text: string, params?: unknown[]) => {
+    if (failures > 0 && text.includes("from units where id")) { failures--; throw new Error("getaddrinfo ENOTFOUND pooler"); }
+    return db.query(text, params);
+  } } as any;
+  const api = fakeApi(() => ({ location: { companyId: "co" } }));
+  const { runUnit } = await import("../src/worker/unit-runner.ts");
+  await runUnit(flaky, unit, api, silent, { once: true, retryBaseMs: 1 });
+  assert.equal(failures, 0, "as duas falhas foram absorvidas");
+  const health = (await db.query(`select status from jobs where kind='health'`)).rows;
+  assert.deepEqual(health, [{ status: "done" }], "depois das falhas, o loop seguiu e executou o health");
+});
+
+test("retomada: jobs e logs 'running' de um processo morto voltam à fila na hora", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  const j = (await db.query(`insert into jobs (unit_id, kind, status, locked_at) values ($1,'conversations','running', now()) returning id`, [unit.id])).rows[0];
+  await db.query(`insert into sync_logs (unit_id, job_id, resource, status) values ($1,$2,'conversations','running')`, [unit.id, j.id]);
+  const { recoverInterrupted } = await import("../src/worker/unit-runner.ts");
+  assert.equal(await recoverInterrupted(db, unit.id), 1);
+  assert.equal((await db.query(`select status from jobs where id=$1`, [j.id])).rows[0].status, "queued");
+  assert.equal((await db.query(`select status from sync_logs`)).rows[0].status, "error");
+});
+
+test("intercalação: continuação de carga longa vai para depois do 1º ciclo dos outros recursos", async () => {
+  const { JOBS, CONTINUATION_PRIORITY_OFFSET } = await import("../src/worker/jobs.ts");
+  const contConversations = JOBS.conversations.priority + CONTINUATION_PRIORITY_OFFSET;
+  for (const k of ["contacts", "opportunities", "appointments"] as const) {
+    assert.ok(JOBS[k].priority < contConversations, `${k} antes da continuação das conversas`);
+  }
+});

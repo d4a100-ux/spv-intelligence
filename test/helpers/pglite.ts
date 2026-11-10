@@ -16,7 +16,9 @@ do $$ begin
   if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon; end if;
 end $$;
 grant usage on schema public, auth to authenticated, anon;
-alter default privileges in schema public grant select on tables to authenticated, anon;
+grant execute on function auth.uid() to authenticated, anon;
+-- Simula o projeto criado com "Automatically expose new tables" DESLIGADO:
+-- nenhum privilégio automático; a migration precisa conceder tudo explicitamente.
 create publication supabase_realtime;
 `;
 

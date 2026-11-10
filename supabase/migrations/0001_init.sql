@@ -835,4 +835,24 @@ begin
 end $$;
 
 -- Realtime para a UI
+-- Privilégios explícitos (o projeto é criado com "Automatically expose new tables" DESLIGADO).
+-- Somente leitura e somente para usuários autenticados; `anon` não recebe nada.
+-- O que cada gestor vê continua limitado pelas policies de RLS acima.
+-- Tabelas sem policy (credenciais, jobs, cursores, eventos brutos) NÃO recebem grant.
+do $$
+declare t text;
+begin
+  foreach t in array array[
+    'units','unit_holidays','app_users','app_user_units','crm_users','contacts','conversations','messages',
+    'pipelines','pipeline_stages','canonical_stages','stage_mappings','opportunities','calendars','appointments',
+    'tasks','contact_assignment_history','contact_follower_history','opportunity_history','appointment_history',
+    'seller_handoffs','operational_alerts','alert_events','metric_definitions','metric_snapshots','sync_logs',
+    'v_active_conversations'
+  ] loop
+    execute format('grant select on %I to authenticated', t);
+  end loop;
+end $$;
+grant execute on function public.has_unit_access(uuid) to authenticated;
+grant execute on function business_minutes(uuid, timestamptz, timestamptz) to authenticated;
+
 alter publication supabase_realtime add table operational_alerts, metric_snapshots, units;

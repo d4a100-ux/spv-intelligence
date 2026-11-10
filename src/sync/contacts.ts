@@ -6,6 +6,10 @@ import { DAY, MINUTE, getCursor, setCursor, setting, type SyncContext, type Sync
 import { asStringArray, normalizeEmail, normalizePhone, toIso } from "../lib/normalize.ts";
 import { recordAssignment, recordFollowers, type DetectedBy } from "../processing/history.ts";
 import type { Db } from "../db/types.ts";
+import { runInLanes } from "../lib/lanes.ts";
+
+/** Gravações paralelas por página (o gargalo é a latência do banco, não a API). */
+const LANES = Number(process.env.SYNC_DB_LANES ?? 8);
 
 type Cursor = { updatedSince: string; searchAfter?: unknown[]; maxUpdated?: string; backfill: boolean };
 
@@ -34,9 +38,13 @@ export async function syncContacts(ctx: SyncContext): Promise<SyncResult> {
     const r = await ctx.api.post("contacts", "/contacts/search", body);
     const list: any[] = r?.contacts ?? [];
 
+    // Paralelo por pistas; mesma chave de duplicidade (telefone/e-mail) = mesma pista, em sequência.
+    const results = await runInLanes(list, LANES,
+      (c) => normalizePhone(c.phone) ?? normalizeEmail(c.email) ?? String(c.id),
+      (c) => upsertContact(ctx, c, detectedBy));
+    for (const n of results) changes += n;
+    upserted += list.length;
     for (const c of list) {
-      changes += await upsertContact(ctx, c, detectedBy);
-      upserted++;
       const u = toIso(c.dateUpdated);
       if (u && u > maxUpdated) maxUpdated = u;
     }

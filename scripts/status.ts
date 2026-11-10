@@ -30,7 +30,7 @@ async function main() {
        (select count(*) from contact_assignment_history x where x.unit_id=u.id and x.time_source<>'snapshot') mudancas_responsavel,
        (select count(*) from contact_follower_history x where x.unit_id=u.id and x.action<>'snapshot') mudancas_seguidor,
        (select count(*) from opportunity_history x where x.unit_id=u.id and x.time_source<>'snapshot') mudancas_oportunidade,
-       (select count(*) from appointment_history x where x.unit_id=u.id) eventos_agendamento,
+       (select count(*) from appointment_history x where x.unit_id=u.id and x.detected_by<>'backfill') eventos_agendamento,
        (select count(*) from seller_handoffs x where x.unit_id=u.id and x.status='awaiting_seller') vendedor_aguardando
      from units u order by u.slug`);
   console.log("== Volume capturado (mudanças excluem o snapshot inicial) ==");

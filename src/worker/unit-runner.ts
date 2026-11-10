@@ -13,30 +13,59 @@ import { sleep } from "../integrations/leadconnector/rate-limiter.ts";
 
 const DEGRADED_AFTER = 3;
 
-export type RunnerOptions = { once?: boolean; idleMs?: number; shouldStop?: () => boolean };
+export type RunnerOptions = { once?: boolean; idleMs?: number; shouldStop?: () => boolean; retryBaseMs?: number };
+
+/**
+ * Chamado ao iniciar a unidade, já com o advisory lock em mãos: se há jobs "running" desta unidade,
+ * eles pertenciam a um processo que morreu (o lock garante que nenhum outro worker os executa).
+ * Voltam para a fila na hora, em vez de esperar 15 minutos.
+ */
+export async function recoverInterrupted(db: Db, unitId: string): Promise<number> {
+  const r = await db.query<{ n: number }>(
+    `with j as (update jobs set status='queued', locked_at=null, run_after=now(), last_error='interrompido: processo anterior encerrou'
+       where unit_id=$1 and status='running' returning id),
+     l as (update sync_logs set status='error', finished_at=now(), error_class='internal', error='interrompido: processo anterior encerrou'
+       where unit_id=$1 and status='running' returning id)
+     select (select count(*)::int from j) n`, [unitId]);
+  return r.rows[0].n;
+}
 
 export async function runUnit(db: Db, unit: UnitRow, api: LcApi, log: Logger, opts: RunnerOptions = {}): Promise<void> {
   const idleMs = opts.idleMs ?? 5000;
-  let lastRecovery = 0;
+  let lastRecovery = Date.now();
+  let consecutiveLoopErrors = 0;
   for (;;) {
     if (opts.shouldStop?.()) return;
-    const fresh = (await db.query<UnitRow & { enabled: boolean }>(`select * from units where id=$1`, [unit.id])).rows[0];
-    if (!fresh?.enabled) { if (opts.once) return; await sleep(30_000); continue; }
-    Object.assign(unit, fresh);
+    try {
+      const fresh = (await db.query<UnitRow & { enabled: boolean }>(`select * from units where id=$1`, [unit.id])).rows[0];
+      if (!fresh?.enabled) { if (opts.once) return; await sleep(30_000); continue; }
+      Object.assign(unit, fresh);
 
-    if (Date.now() - lastRecovery > 5 * 60_000) {
-      await db.query(
-        `update jobs set status='queued', locked_at=null, last_error='recuperado após travamento'
-         where unit_id=$1 and status='running' and locked_at < now() - interval '15 minutes'`, [unit.id]);
-      lastRecovery = Date.now();
+      if (Date.now() - lastRecovery > 5 * 60_000) {
+        await db.query(
+          `update jobs set status='queued', locked_at=null, last_error='recuperado após travamento'
+           where unit_id=$1 and status='running' and locked_at < now() - interval '15 minutes'`, [unit.id]);
+        lastRecovery = Date.now();
+      }
+
+      const lowQuota = api.limiter.lastDailyRemaining !== null && api.limiter.lastDailyRemaining < config.dailyReserve;
+      await enqueueDue(db, unit.id, { onlyHealth: unit.connection_status === "error", lowQuota });
+
+      const job = (await db.query(`select * from claim_job($1)`, [unit.id])).rows[0];
+      consecutiveLoopErrors = 0;
+      if (!job) { if (opts.once) return; await sleep(idleMs); continue; }
+      await executeJob(db, unit, api, log, job);
+    } catch (e) {
+      // Falha de infraestrutura (banco/rede/DNS) FORA de um job: não derruba a unidade.
+      // O job em andamento (se houver) é recuperado pelo mecanismo de travamento.
+      consecutiveLoopErrors++;
+      const wait = Math.min(300_000, (opts.retryBaseMs ?? 5_000) * 2 ** Math.min(consecutiveLoopErrors, 6));
+      log.warn("falha de infraestrutura no loop da unidade; nova tentativa", {
+        error: e instanceof Error ? e.message : String(e), attempt: consecutiveLoopErrors, retryInMs: wait,
+      });
+      if (opts.once && consecutiveLoopErrors >= 3) throw e;
+      await sleep(wait);
     }
-
-    const lowQuota = api.limiter.lastDailyRemaining !== null && api.limiter.lastDailyRemaining < config.dailyReserve;
-    await enqueueDue(db, unit.id, { onlyHealth: unit.connection_status === "error", lowQuota });
-
-    const job = (await db.query(`select * from claim_job($1)`, [unit.id])).rows[0];
-    if (!job) { if (opts.once) return; await sleep(idleMs); continue; }
-    await executeJob(db, unit, api, log, job);
   }
 }
 
