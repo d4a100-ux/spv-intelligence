@@ -107,7 +107,7 @@ Depois de cada correção, rode `npm run validate` de novo.
 **7.1 Banco do piloto.** É um projeto Supabase **separado da produção**.
 1. Em supabase.com, clique em **New project** e use o nome `spv-intelligence-piloto`. Escolha a região São Paulo (`sa-east-1`) e uma senha forte, guardada no seu cofre de senhas.
 2. Vá em **SQL Editor → New query**, cole todo o conteúdo de `supabase/migrations/0001_init.sql` e clique em **Run**. Isso é feito por você, no banco do piloto.
-3. Vá em **Project Settings → Database → Connection string → Session pooler**, copie a URL para `DATABASE_URL` no `.env.local` e troque `[YOUR-PASSWORD]` pela senha.
+3. Clique em **Connect → Direct → Transaction pooler** (porta **6543**), copie a URL para `DATABASE_URL` no `.env.local` e troque `[YOUR-PASSWORD]` pela senha, **sem os colchetes**. Não use o Session pooler (5432): ele tem limite de 15 conexões e deixa sessões-fantasma após quedas de rede (incidente de 10/11/2026).
 
 > O histórico capturado neste projeto **é o histórico real** a partir do H0. Na Etapa 3, este projeto é promovido a produção ou tem os dados migrados com `pg_dump`. Ele **não** deve ser apagado.
 

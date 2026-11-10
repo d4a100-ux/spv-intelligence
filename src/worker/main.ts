@@ -22,8 +22,12 @@ process.on("SIGTERM", () => { stopping = true; });
 
 const running = new Map<string, Promise<void>>();
 
-/** Identidade desta instância do worker (aparece em unit_leases.holder). */
-const HOLDER = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+/**
+ * Identidade desta instância do worker (unit_leases.holder). Quando rodando sob o supervisor, a
+ * identidade é ESTÁVEL entre religamentos (SPV_WORKER_ID): o processo religado retoma o próprio
+ * lease na hora, em vez de esperar ele expirar (até 2 min).
+ */
+const HOLDER = `${hostname()}:${process.env.SPV_WORKER_ID ?? `${process.pid}:${randomUUID().slice(0, 8)}`}`;
 
 async function startUnit(unitId: string, slug: string) {
   // Lease por unidade (tabela unit_leases): impede dois workers na mesma subconta e expira

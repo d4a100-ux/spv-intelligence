@@ -5,6 +5,10 @@
  * Ctrl+C encerra o supervisor e o worker.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+
+/** Identidade deste supervisor: o worker religado herda a mesma e retoma o próprio lease. */
+const WORKER_ID = `sup-${process.pid}-${randomUUID().slice(0, 8)}`;
 
 const args = process.argv.slice(2);
 let child: ChildProcess | null = null;
@@ -16,7 +20,10 @@ const log = (msg: string, extra: Record<string, unknown> = {}) =>
 
 function start() {
   const startedAt = Date.now();
-  child = spawn(process.execPath, ["--env-file=.env.local", "src/worker/main.ts", ...args], { stdio: "inherit" });
+  child = spawn(process.execPath, ["--env-file=.env.local", "src/worker/main.ts", ...args], {
+    stdio: "inherit",
+    env: { ...process.env, SPV_WORKER_ID: WORKER_ID },   // mesma identidade em todos os religamentos
+  });
   child.on("exit", (code, signal) => {
     child = null;
     if (stopping) return process.exit(0);

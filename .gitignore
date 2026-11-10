@@ -1,7 +1,8 @@
 node_modules/
 .next/
-.env
-.env.local
-.env.*.local
+# Qualquer arquivo de ambiente (segredos), exceto o modelo vazio
+.env*
+!.env.example
+*.bak
 reports/
 *.log

@@ -119,3 +119,15 @@ test("privilégios explícitos: gestor lê dados da sua unidade; anon não lê n
   await assert.rejects(db.query(`select * from contacts`), /permission denied/);
   await pg.exec(`reset role;`);
 });
+
+test("limites por transação: aceitos pelo Postgres e válidos só dentro da transação", async () => {
+  const { pg } = await createTestDb();
+  const { TX_GUARDS } = await import("../src/db/pg.ts");
+  await pg.exec("begin");
+  await pg.exec(TX_GUARDS);
+  const inside = (await pg.query<any>(`select current_setting('lock_timeout') lt, current_setting('idle_in_transaction_session_timeout') it`)).rows[0];
+  await pg.exec("commit");
+  const after = (await pg.query<any>(`select current_setting('lock_timeout') lt, current_setting('idle_in_transaction_session_timeout') it`)).rows[0];
+  assert.deepEqual(inside, { lt: "15s", it: "1min" });
+  assert.deepEqual(after, { lt: "0", it: "0" }, "não vaza para a sessão (seguro no pooler Transaction)");
+});

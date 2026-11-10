@@ -326,3 +326,23 @@ test("lease no worker: renovação falhando por muito tempo → worker assume pe
   assert.match(lostReason, /renovação falhando/);
   lease!.stop();
 });
+
+test("transação: erro na conexão reservada não derruba o processo e a conexão é descartada", async () => {
+  const { EventEmitter } = await import("node:events");
+  const pgMod = (await import("pg")).default;
+  const client: any = new EventEmitter();
+  let releasedWith: unknown = "não liberado";
+  client.query = async (sql: string) => {
+    if (sql === "begin") { setImmediate(() => client.emit("error", new Error("read ECONNRESET"))); return { rows: [] }; }
+    if (sql === "rollback") return { rows: [] };
+    await new Promise((r) => setTimeout(r, 5));          // o 'error' chega ENTRE comandos
+    throw new Error("Connection terminated unexpectedly");
+  };
+  client.release = (e?: unknown) => { releasedWith = e; };
+  const fakePool: any = Object.create(pgMod.Pool.prototype);
+  fakePool.connect = async () => client;
+  const { wrapForTest } = await import("../src/db/pg.ts");
+  await assert.rejects(wrapForTest(fakePool).tx(async (db) => db.query("select 1")), /terminated/);
+  assert.ok(releasedWith instanceof Error, "conexão quebrada é descartada, não devolvida ao pool");
+  assert.equal(client.listenerCount("error"), 0, "handler removido após a transação");
+});
