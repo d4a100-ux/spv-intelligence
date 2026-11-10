@@ -4,10 +4,13 @@
  *   npm run worker -- --once → processa os jobs vencidos e encerra (diagnóstico)
  *   npm run worker -- --unit carros-online → só uma unidade
  */
-import { getDb, getPool, closeDb } from "../db/pg.ts";
+import { hostname } from "node:os";
+import { randomUUID } from "node:crypto";
+import { getDb, closeDb } from "../db/pg.ts";
 import { createLogger } from "../lib/log.ts";
 import { loadUnitClient } from "../units/load.ts";
 import { recoverInterrupted, runUnit } from "./unit-runner.ts";
+import { acquireLease } from "./lease.ts";
 
 const args = process.argv.slice(2);
 const once = args.includes("--once");
@@ -19,30 +22,31 @@ process.on("SIGTERM", () => { stopping = true; });
 
 const running = new Map<string, Promise<void>>();
 
+/** Identidade desta instância do worker (aparece em unit_leases.holder). */
+const HOLDER = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+
 async function startUnit(unitId: string, slug: string) {
-  // Advisory lock por unidade: impede dois workers processando a mesma subconta.
-  const client = await getPool().connect();
-  // Se a conexão da trava cair, a trava é perdida no servidor: para esta unidade com segurança
-  // (o próximo discover() a reinicia com uma trava nova).
-  let lockLost = false;
-  client.on("error", (e) => { lockLost = true; log.warn("conexão da trava da unidade perdida; reiniciando unidade", { unit: slug, error: e.message }); });
-  let got = false;
-  try {
-    got = (await client.query(`select pg_try_advisory_lock(hashtext('spv-unit:' || $1)) ok`, [unitId])).rows[0].ok;
-  } catch (e) { client.release(true); throw e; }
-  if (!got) { client.release(); log.warn("unidade já em execução em outro worker", { unit: slug }); return; }
+  // Lease por unidade (tabela unit_leases): impede dois workers na mesma subconta e expira
+  // sozinho se este processo morrer ou perder a rede — sem depender de sessão no servidor.
   const db = getDb();
-  const { unit, api } = await loadUnitClient(db, unitId);
-  const recovered = await recoverInterrupted(db, unitId);
-  log.info("unidade iniciada", { unit: slug, jobsRecuperados: recovered });
-  const p = runUnit(db, unit, api, log.child({ unit: slug }), { once, shouldStop: () => stopping || lockLost })
-    .catch((e) => log.error("loop da unidade abortou", { unit: slug, error: e instanceof Error ? e.message : String(e) }))
-    .finally(async () => {
-      if (!lockLost) await client.query(`select pg_advisory_unlock(hashtext('spv-unit:' || $1))`, [unitId]).catch(() => {});
-      client.release(lockLost);
-      running.delete(unitId);
-    });
-  running.set(unitId, p);
+  const lease = await acquireLease(db, unitId, HOLDER, {
+    onLost: (reason) => log.warn("lease da unidade perdido; parando a unidade (será retomada)", { unit: slug, reason }),
+  });
+  if (!lease) { log.warn("unidade em uso por outro worker (lease ativo)", { unit: slug }); return; }
+  running.set(unitId, Promise.resolve()); // reserva o slot antes de qualquer await
+  try {
+    const { unit, api } = await loadUnitClient(db, unitId);
+    const recovered = await recoverInterrupted(db, unitId);
+    log.info("unidade iniciada", { unit: slug, jobsRecuperados: recovered, holder: HOLDER });
+    const p = runUnit(db, unit, api, log.child({ unit: slug }), { once, shouldStop: () => stopping || lease.isLost() })
+      .catch((e) => log.error("loop da unidade abortou", { unit: slug, error: e instanceof Error ? e.message : String(e) }))
+      .finally(async () => { await lease.release(); running.delete(unitId); });
+    running.set(unitId, p);
+  } catch (e) {
+    await lease.release();
+    running.delete(unitId);
+    throw e;
+  }
 }
 
 async function discover() {

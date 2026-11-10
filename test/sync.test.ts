@@ -295,3 +295,34 @@ test("intercalação: continuação de carga longa vai para depois do 1º ciclo 
     assert.ok(JOBS[k].priority < contConversations, `${k} antes da continuação das conversas`);
   }
 });
+
+test("lease: exclusivo por unidade, renovável pelo dono, retomável após expirar", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  const acq = async (holder: string, ttl = 120) => (await db.query(`select acquire_unit_lease($1,$2,$3) ok`, [unit.id, holder, ttl])).rows[0].ok;
+  assert.equal(await acq("A"), true, "A adquire");
+  assert.equal(await acq("B"), false, "B não rouba lease ativo");
+  assert.equal(await acq("A"), true, "A renova");
+  await db.query(`update unit_leases set expires_at = now() - interval '1 second'`);
+  assert.equal(await acq("B"), true, "B assume após expirar (A morreu/perdeu a rede)");
+  assert.equal(await acq("A"), false, "A não volta enquanto B está ativo");
+  await db.query(`select release_unit_lease($1,'A')`, [unit.id]);
+  assert.equal((await db.query(`select holder from unit_leases`)).rows[0].holder, "B", "release de quem não é dono não remove");
+});
+
+test("lease no worker: renovação falhando por muito tempo → worker assume perda e para", async () => {
+  const { db } = await createTestDb();
+  const unit = await setupUnit(db, "carros-online", "LOC");
+  const { acquireLease } = await import("../src/worker/lease.ts");
+  let t = 0, failRenew = false, lostReason = "";
+  const flaky = { ...db, query: async (q: string, p?: unknown[]) => { if (failRenew) throw new Error("ECONNRESET"); return db.query(q, p); } } as any;
+  const lease = await acquireLease(flaky, unit.id, "W1", { ttlSeconds: 120, renewEveryMs: 5, now: () => t, onLost: (r) => { lostReason = r; } });
+  assert.ok(lease);
+  failRenew = true;
+  t = 60_000; await new Promise((r) => setTimeout(r, 20));
+  assert.equal(lease!.isLost(), false, "60 s sem renovar: ainda dentro da margem");
+  t = 91_000; await new Promise((r) => setTimeout(r, 20));
+  assert.equal(lease!.isLost(), true, "> 75% do TTL sem renovar: para antes que outro worker assuma");
+  assert.match(lostReason, /renovação falhando/);
+  lease!.stop();
+});

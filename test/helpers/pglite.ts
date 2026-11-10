@@ -2,7 +2,7 @@
  * Postgres real (PGlite/WASM) em memória para testes. NÃO é o banco de produção.
  * Simula apenas o que o Supabase provê por padrão: schema auth, auth.uid(), papéis e publication.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import type { Db } from "../../src/db/types.ts";
 
@@ -25,7 +25,11 @@ create publication supabase_realtime;
 export async function createTestDb(): Promise<{ pg: PGlite; db: Db }> {
   const pg = new PGlite();
   await pg.exec(SUPABASE_STUBS);
-  await pg.exec(readFileSync(new URL("../../supabase/migrations/0001_init.sql", import.meta.url), "utf8"));
+  // Aplica TODAS as migrations em ordem, como o npm run migrate faz no banco real.
+  const dir = new URL("../../supabase/migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((x) => x.endsWith(".sql")).sort()) {
+    await pg.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
   return { pg, db: pgliteDb(pg) };
 }
 
